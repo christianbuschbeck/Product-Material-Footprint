@@ -1,0 +1,9 @@
+﻿Material;Database;Category;CF TMR fossil;Unit
+Coal, brown, in ground;ecoinvent3.8;elementary exchanges/natural resource/in ground;1,30;kg primary material/kg material
+Coal, hard, in ground;ecoinvent3.8;elementary exchanges/natural resource/in ground;1,20;kg primary material/kg material
+Gas, mine, off-gas, process, coal mining;ecoinvent3.8;elementary exchanges/natural resource/in ground;0,80;kg primary material/m3 material
+Gas, natural, in ground;ecoinvent3.8;elementary exchanges/natural resource/in ground;0,80;kg primary material/m3 material
+Gas, natural, in ground, used as raw material;ecoinvent3.8;elementary exchanges/natural resource/in ground;0,80;kg primary material/m3 material
+Oil, crude, in ground;ecoinvent3.8;elementary exchanges/natural resource/in ground;1,20;kg primary material/kg material
+Oil, crude, in ground, used as raw material;ecoinvent3.8;elementary exchanges/natural resource/in ground;1,20;kg primary material/kg material
+Peat, in ground;ecoinvent3.8;elementary exchanges/natural resource/biotic;1,00;kg primary material/kg material
