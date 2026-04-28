@@ -1,16 +1,16 @@
+"""Brightway PMF method creation utilities.
+
+This module contains functions that add Product Material Footprint (PMF)
+methods and the required supporting flows or exchanges to a Brightway project.
+"""
+
 from importlib.resources import files
 from pathlib import Path
 
 import pandas as pd
 
-def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
-    import bw2data as bd
 
-    base = files("product_material_footprint.characterization_factors")
-    cf_dir = Path(base.joinpath(f"characterization_factors_{cf_version}"))
-
-    bd.projects.set_current(bw_project_name)
-
+def _find_relevant_databases(bd):
     ecoinvent_name = None
     biosphere_name = None
 
@@ -21,6 +21,34 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     for db in list(bd.databases):
         if "biosphere" in db:
             biosphere_name = db
+
+    return ecoinvent_name, biosphere_name
+
+
+def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
+    """Create the characterization-factor-based PMF methods in a Brightway project.
+
+    Parameters
+    ----------
+    cf_version:
+        Characterization factor version to load, for example ``"3.11"``.
+    bw_project_name:
+        Name of the Brightway project that should receive the PMF methods.
+
+    Raises
+    ------
+    ValueError
+        If no database containing ``"cutoff"`` or ``"biosphere"`` can be found
+        in the selected Brightway project.
+    """
+    import bw2data as bd
+
+    base = files("product_material_footprint.characterization_factors")
+    cf_dir = Path(base.joinpath(f"characterization_factors_{cf_version}"))
+
+    bd.projects.set_current(bw_project_name)
+
+    ecoinvent_name, biosphere_name = _find_relevant_databases(bd)
 
     if ecoinvent_name is None:
         raise ValueError("No database containing 'cutoff' was found.")
@@ -447,6 +475,11 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     """
 
 def create_pmf_method_direct():
+  """Create the direct PMF methods and supporting exchanges in Brightway.
+
+  This workflow derives PMF information directly from the available ecoinvent
+  and biosphere data in the current Brightway project.
+  """
   import bw2data as bd
 
   for db in list(bd.databases):
