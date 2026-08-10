@@ -4,28 +4,218 @@ This module contains functions that add Product Material Footprint (PMF)
 methods and the required supporting flows or exchanges to a Brightway project.
 """
 
+import warnings
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
+VIACF_EXCHANGE_GROUPS = (
+    {
+        "exchange_name": "Agrar RMI",
+        "input_flow_name": "Agrar RMI",
+        "filename": "agrar_rmi.csv",
+        "value_column": "CF RMI agriculture",
+        "coverage_label": "Agricultural RMI",
+    },
+    {
+        "exchange_name": "Agrar TMR",
+        "input_flow_name": "Agrar TMR",
+        "filename": "agrar_tmr.csv",
+        # The source TMR table itself uses this historical column heading.
+        "value_column": "CF RMI agriculture",
+        "coverage_label": "Agricultural TMR",
+    },
+    {
+        "exchange_name": "Aqua RMI",
+        "input_flow_name": "Aquatic RMI",
+        "filename": "aquatic_rmi.csv",
+        "value_column": "CF RMI aquatic",
+        "coverage_label": "Aquatic RMI",
+    },
+    {
+        "exchange_name": "Aqua TMR",
+        "input_flow_name": "Aquatic TMR",
+        "filename": "aquatic_tmr.csv",
+        "value_column": "CF TMR aquatic",
+        "coverage_label": "Aquatic TMR",
+    },
+)
 
-def _find_relevant_databases(bd):
-    ecoinvent_name = None
-    biosphere_name = None
 
-    for db in list(bd.databases):
-        if "cutoff" in db:
-            ecoinvent_name = db
+def _select_database(
+    database_names: list[str], explicit_name: str | None, marker: str, role: str
+) -> str | None:
+    """Resolve one database name, rejecting ambiguous automatic matches."""
+    if explicit_name is not None:
+        if explicit_name not in database_names:
+            raise ValueError(
+                f"The explicitly selected {role} database {explicit_name!r} does not exist. "
+                f"Available databases: {database_names!r}."
+            )
+        return explicit_name
 
-    for db in list(bd.databases):
-        if "biosphere" in db:
-            biosphere_name = db
+    candidates = sorted(name for name in database_names if marker in name.casefold())
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Multiple {role} database candidates contain {marker!r}: {candidates!r}. "
+            f"Pass {role}_database explicitly."
+        )
+    return candidates[0] if candidates else None
 
+
+def _find_relevant_databases(
+    bd,
+    ecoinvent_database: str | None = None,
+    biosphere_database: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Return explicit or uniquely auto-detected ecoinvent and biosphere names."""
+    database_names = list(bd.databases)
+    ecoinvent_name = _select_database(
+        database_names, ecoinvent_database, "cutoff", "ecoinvent"
+    )
+    biosphere_name = _select_database(
+        database_names, biosphere_database, "biosphere", "biosphere"
+    )
     return ecoinvent_name, biosphere_name
 
 
-def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
+def _get_cf_directory(cf_version: str) -> Path:
+    base = files("product_material_footprint.characterization_factors")
+    cf_dir = Path(base.joinpath(f"characterization_factors_{cf_version}"))
+    if not cf_dir.is_dir():
+        raise ValueError(
+            f"No characterization-factor data found for version {cf_version!r}."
+        )
+    return cf_dir
+
+
+def _load_viacf_exchange_tables(
+    cf_version: str,
+) -> list[tuple[dict[str, str], pd.DataFrame]]:
+    """Load the tables which drive agricultural and aquatic exchanges."""
+    cf_dir = _get_cf_directory(cf_version)
+    return [
+        (group, pd.read_csv(cf_dir / group["filename"], sep=";", decimal=","))
+        for group in VIACF_EXCHANGE_GROUPS
+    ]
+
+
+def _get_viacf_exchange_coverage(cf_version: str) -> list[dict[str, Any]]:
+    """Describe which version-specific exchange tables contain data rows."""
+    return [
+        {
+            **group,
+            "row_count": len(table.index),
+            "has_data": not table.empty,
+        }
+        for group, table in _load_viacf_exchange_tables(cf_version)
+    ]
+
+
+def _build_factor_map(table: pd.DataFrame, value_column: str) -> dict[str, Any]:
+    """Map materials to factors while retaining the source table's first match."""
+    unique_rows = table.drop_duplicates(subset="Material", keep="first")
+    return dict(zip(unique_rows["Material"], unique_rows[value_column], strict=True))
+
+
+def _ensure_biosphere_flow(biosphere_db, biosphere_name: str, flow_name: str):
+    """Return one exact flow, creating it if absent and warning on duplicates."""
+    matches = [flow for flow in biosphere_db if flow["name"] == flow_name]
+    if len(matches) > 1:
+        warnings.warn(
+            f"Found {len(matches)} biosphere flows named {flow_name!r}; using the first and "
+            "leaving existing duplicates unchanged.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if matches:
+        return matches[0]
+
+    flow = biosphere_db.new_activity(
+        **{
+            "categories": ("natural resource", "none"),
+            "code": flow_name,
+            "CAS number": None,
+            "name": flow_name,
+            "database": biosphere_name,
+            "unit": "kilogram",
+            "type": "natural resource",
+        }
+    )
+    flow.save()
+    return flow
+
+
+def _write_method(
+    bd, method_key: tuple[str, str, str], factors: list[tuple[Any, Any]]
+) -> None:
+    """Register a method once and replace its factors on subsequent runs."""
+    method = bd.Method(method_key)
+    if method_key not in bd.methods:
+        method.register()
+    method.write(factors)
+
+
+def _dataset_key(dataset) -> tuple[str, str]:
+    key = getattr(dataset, "key", None)
+    if key is not None:
+        return tuple(key)
+    return dataset["database"], dataset["code"]
+
+
+def _exchange_input_key(exchange) -> tuple[str, str] | None:
+    input_key = exchange.get("input")
+    if input_key is not None:
+        return tuple(input_key)
+    input_dataset = getattr(exchange, "input", None)
+    return _dataset_key(input_dataset) if input_dataset is not None else None
+
+
+def _upsert_biosphere_exchange(
+    activity, input_flow, amount: float, exchange_name: str
+) -> None:
+    """Create or update one exchange without silently removing duplicates."""
+    input_key = _dataset_key(input_flow)
+    matches = [
+        exchange
+        for exchange in activity.exchanges()
+        if exchange.get("type") == "biosphere"
+        and _exchange_input_key(exchange) == input_key
+    ]
+
+    if len(matches) > 1:
+        warnings.warn(
+            f"Found {len(matches)} biosphere exchanges from activity "
+            f"{_dataset_key(activity)!r} to {input_key!r}; existing duplicates were not changed.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+
+    if matches:
+        exchange = matches[0]
+        changed = (
+            exchange.get("amount") != amount or exchange.get("name") != exchange_name
+        )
+        if changed:
+            exchange["amount"] = amount
+            exchange["name"] = exchange_name
+            exchange.save()
+        return
+
+    exchange = activity.new_exchange(input=input_flow, amount=amount, type="biosphere")
+    exchange["name"] = exchange_name
+    exchange.save()
+
+
+def create_pmf_method_viacf(
+    cf_version: str,
+    bw_project_name: str,
+    ecoinvent_database: str | None = None,
+    biosphere_database: str | None = None,
+) -> None:
     """Create the characterization-factor-based PMF methods in a Brightway project.
 
     Parameters
@@ -34,6 +224,9 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
         Characterization factor version to load, for example ``"3.11"``.
     bw_project_name:
         Name of the Brightway project that should receive the PMF methods.
+    ecoinvent_database, biosphere_database:
+        Optional exact database names. If omitted, automatic detection succeeds
+        only when one unambiguous matching database exists.
 
     Raises
     ------
@@ -43,12 +236,15 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     """
     import bw2data as bd
 
-    base = files("product_material_footprint.characterization_factors")
-    cf_dir = Path(base.joinpath(f"characterization_factors_{cf_version}"))
+    cf_dir = _get_cf_directory(cf_version)
 
     bd.projects.set_current(bw_project_name)
 
-    ecoinvent_name, biosphere_name = _find_relevant_databases(bd)
+    ecoinvent_name, biosphere_name = _find_relevant_databases(
+        bd,
+        ecoinvent_database=ecoinvent_database,
+        biosphere_database=biosphere_database,
+    )
 
     if ecoinvent_name is None:
         raise ValueError("No database containing 'cutoff' was found.")
@@ -62,61 +258,10 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     ## Biotic  ####
     ###############
 
-    if len(biosphere_db.search("Agrar RMI")) == 0:
-        newflow = biosphere_db.new_activity(
-            **{
-                "categories": ("natural resource", "none"),
-                "code": "Agrar RMI",
-                "CAS number": None,
-                "name": "Agrar RMI",
-                "database": biosphere_name,
-                "unit": "kilogram",
-                "type": "natural resource",
-            }
-        )
-        newflow.save()
-
-    if len(biosphere_db.search("Agrar TMR")) == 0:
-        newflow = biosphere_db.new_activity(
-            **{
-                "categories": ("natural resource", "none"),
-                "code": "Agrar TMR",
-                "CAS number": None,
-                "name": "Agrar TMR",
-                "database": biosphere_name,
-                "unit": "kilogram",
-                "type": "natural resource",
-            }
-        )
-        newflow.save()
-
-    if len(biosphere_db.search("Aquatic RMI")) == 0:
-        newflow = biosphere_db.new_activity(
-            **{
-                "categories": ("natural resource", "none"),
-                "code": "Aquatic RMI",
-                "CAS number": None,
-                "name": "Aquatic RMI",
-                "database": biosphere_name,
-                "unit": "kilogram",
-                "type": "natural resource",
-            }
-        )
-        newflow.save()
-
-    if len(biosphere_db.search("Aquatic TMR")) == 0:
-        newflow = biosphere_db.new_activity(
-            **{
-                "categories": ("natural resource", "none"),
-                "code": "Aquatic TMR",
-                "CAS number": None,
-                "name": "Aquatic TMR",
-                "database": biosphere_name,
-                "unit": "kilogram",
-                "type": "natural resource",
-            }
-        )
-        newflow.save()
+    rmi_agrar_flow = _ensure_biosphere_flow(biosphere_db, biosphere_name, "Agrar RMI")
+    tmr_agrar_flow = _ensure_biosphere_flow(biosphere_db, biosphere_name, "Agrar TMR")
+    rmi_aqua_flow = _ensure_biosphere_flow(biosphere_db, biosphere_name, "Aquatic RMI")
+    tmr_aqua_flow = _ensure_biosphere_flow(biosphere_db, biosphere_name, "Aquatic TMR")
 
     rmi_forest_df = pd.read_csv(cf_dir / "forest_rmi.csv", sep=";", decimal=",")
     tmr_forest_df = pd.read_csv(cf_dir / "forest_tmr.csv", sep=";", decimal=",")
@@ -125,14 +270,14 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     tmr_forest = []
 
     # Forestry
-    for idx in range(0, rmi_forest_df.shape[0]):
+    for idx in range(rmi_forest_df.shape[0]):
         f = rmi_forest_df.at[idx, "Material"]
         v = rmi_forest_df.at[idx, "CF RMI forestry"]
         x = [act for act in biosphere_db if f in act["name"]]
         if x != []:
             rmi_forest.append((x[0], v))
 
-    for idx in range(0, tmr_forest_df.shape[0]):
+    for idx in range(tmr_forest_df.shape[0]):
         f = tmr_forest_df.at[idx, "Material"]
         v = tmr_forest_df.at[idx, "CF TMR forestry"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -145,73 +290,48 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     rmi_aqua = []
     tmr_aqua = []
 
-    rmi_agrar_flow = None
-    tmr_agrar_flow = None
-    rmi_aqua_flow = None
-    tmr_aqua_flow = None
-
-    for x in biosphere_db:
-        if x["name"] == "Agrar RMI":
-            rmi_agrar.append((x, 1))
-            rmi_agrar_flow = x
-        if x["name"] == "Agrar TMR":
-            tmr_agrar.append((x, 1))
-            tmr_agrar_flow = x
-        if x["name"] == "Aquatic RMI":
-            rmi_aqua.append((x, 1))
-            rmi_aqua_flow = x
-        if x["name"] == "Aquatic TMR":
-            tmr_aqua.append((x, 1))
-            tmr_aqua_flow = x
-
-    if rmi_agrar_flow is None or tmr_agrar_flow is None or rmi_aqua_flow is None or tmr_aqua_flow is None:
-        raise ValueError("Required biotic biosphere flows could not be found.")
+    rmi_agrar.append((rmi_agrar_flow, 1))
+    tmr_agrar.append((tmr_agrar_flow, 1))
+    rmi_aqua.append((rmi_aqua_flow, 1))
+    tmr_aqua.append((tmr_aqua_flow, 1))
 
     rmi_biotic = rmi_agrar + rmi_forest + rmi_aqua
     tmr_biotic = tmr_agrar + tmr_forest + tmr_aqua
 
     # Biotic
     pmf_biotic_rmi_method_key = ("PMF Biotic RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(pmf_biotic_rmi_method_key).register()
-    bd.Method(pmf_biotic_rmi_method_key).write(rmi_biotic)
+    _write_method(bd, pmf_biotic_rmi_method_key, rmi_biotic)
     # bd.Method(pmf_biotic_rmi_method_key).load()
 
     pmf_biotic_tmr_method_key = ("PMF Biotic TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(pmf_biotic_tmr_method_key).register()
-    bd.Method(pmf_biotic_tmr_method_key).write(tmr_biotic)
+    _write_method(bd, pmf_biotic_tmr_method_key, tmr_biotic)
     # bd.Method(pmf_biotic_tmr_method_key).load()
 
     # Agrar
     agrar_rmi_method_key = ("Agrar RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(agrar_rmi_method_key).register()
-    bd.Method(agrar_rmi_method_key).write(rmi_agrar)
+    _write_method(bd, agrar_rmi_method_key, rmi_agrar)
     # bd.Method(agrar_rmi_method_key).load()
 
     agrar_tmr_method_key = ("Agrar TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(agrar_tmr_method_key).register()
-    bd.Method(agrar_tmr_method_key).write(tmr_agrar)
+    _write_method(bd, agrar_tmr_method_key, tmr_agrar)
     # bd.Method(agrar_tmr_method_key).load()
 
     # Forest
     forest_rmi_method_key = ("Forest RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(forest_rmi_method_key).register()
-    bd.Method(forest_rmi_method_key).write(rmi_forest)
+    _write_method(bd, forest_rmi_method_key, rmi_forest)
     # bd.Method(forest_rmi_method_key).load()
 
     forest_tmr_method_key = ("Forest TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(forest_tmr_method_key).register()
-    bd.Method(forest_tmr_method_key).write(tmr_forest)
+    _write_method(bd, forest_tmr_method_key, tmr_forest)
     # bd.Method(forest_tmr_method_key).load()
 
     # Aqua
     aqua_rmi_method_key = ("Aqua RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(aqua_rmi_method_key).register()
-    bd.Method(aqua_rmi_method_key).write(rmi_aqua)
+    _write_method(bd, aqua_rmi_method_key, rmi_aqua)
     # bd.Method(aqua_rmi_method_key).load()
 
     aqua_tmr_method_key = ("Aqua TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(aqua_tmr_method_key).register()
-    bd.Method(aqua_tmr_method_key).write(tmr_aqua)
+    _write_method(bd, aqua_tmr_method_key, tmr_aqua)
     # bd.Method(aqua_tmr_method_key).load()
 
     """
@@ -236,7 +356,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     rmi_fossil = []
     tmr_fossil = []
 
-    for idx in range(0, rmi_fossil_df.shape[0]):
+    for idx in range(rmi_fossil_df.shape[0]):
         f = rmi_fossil_df.at[idx, "Flow"]
         v = rmi_fossil_df.at[idx, "CF RMI fossil"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -247,7 +367,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
                 if "natural resource" in el["categories"][0]:
                     rmi_fossil.append((el, v))
 
-    for idx in range(0, tmr_fossil_df.shape[0]):
+    for idx in range(tmr_fossil_df.shape[0]):
         f = tmr_fossil_df.at[idx, "Flow"]
         v = tmr_fossil_df.at[idx, "CF TMR fossil"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -265,7 +385,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     rmi_metal = []
     tmr_metal = []
 
-    for idx in range(0, rmi_metal_df.shape[0]):
+    for idx in range(rmi_metal_df.shape[0]):
         f = rmi_metal_df.at[idx, "Material"]
         v = rmi_metal_df.at[idx, "CF RMI metal ores"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -280,7 +400,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
         if found is False:
             notfound.append(f)
 
-    for idx in range(0, tmr_metal_df.shape[0]):
+    for idx in range(tmr_metal_df.shape[0]):
         f = tmr_metal_df.at[idx, "Material"]
         v = tmr_metal_df.at[idx, "CF TMR metal ores"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -302,7 +422,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     rmi_mineral = []
     tmr_mineral = []
 
-    for idx in range(0, rmi_mineral_df.shape[0]):
+    for idx in range(rmi_mineral_df.shape[0]):
         f = rmi_mineral_df.at[idx, "Material"]
         v = rmi_mineral_df.at[idx, "CF RMI non-metallic minerals"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -316,7 +436,7 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
         if found is False:
             notfound.append(f)
 
-    for idx in range(0, tmr_mineral_df.shape[0]):
+    for idx in range(tmr_mineral_df.shape[0]):
         f = tmr_mineral_df.at[idx, "Material"]
         v = tmr_mineral_df.at[idx, "CF TMR non-metallic minerals"]
         x = [act for act in biosphere_db if f in act["name"]]
@@ -335,46 +455,38 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
 
     # Abiotic
     pmf_abiotic_rmi_method_key = ("PMF Abiotic RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(pmf_abiotic_rmi_method_key).register()
-    bd.Method(pmf_abiotic_rmi_method_key).write(abiotic_rmi)
+    _write_method(bd, pmf_abiotic_rmi_method_key, abiotic_rmi)
     # bd.Method(pmf_abiotic_rmi_method_key).load()
 
     pmf_abiotic_tmr_method_key = ("PMF Abiotic TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(pmf_abiotic_tmr_method_key).register()
-    bd.Method(pmf_abiotic_tmr_method_key).write(abiotic_tmr)
+    _write_method(bd, pmf_abiotic_tmr_method_key, abiotic_tmr)
     # bd.Method(pmf_abiotic_tmr_method_key).load()
 
     # Fossil
     fossil_rmi_method_key = ("Fossil RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(fossil_rmi_method_key).register()
-    bd.Method(fossil_rmi_method_key).write(rmi_fossil)
+    _write_method(bd, fossil_rmi_method_key, rmi_fossil)
     # bd.Method(fossil_rmi_method_key).load()
 
     fossil_tmr_method_key = ("Fossil TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(fossil_tmr_method_key).register()
-    bd.Method(fossil_tmr_method_key).write(tmr_fossil)
+    _write_method(bd, fossil_tmr_method_key, tmr_fossil)
     # bd.Method(fossil_tmr_method_key).load()
 
     # Metal
     metal_rmi_method_key = ("Metal RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(metal_rmi_method_key).register()
-    bd.Method(metal_rmi_method_key).write(rmi_metal)
+    _write_method(bd, metal_rmi_method_key, rmi_metal)
     # bd.Method(metal_rmi_method_key).load()
 
     metal_tmr_method_key = ("Metal TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(metal_tmr_method_key).register()
-    bd.Method(metal_tmr_method_key).write(tmr_metal)
+    _write_method(bd, metal_tmr_method_key, tmr_metal)
     # bd.Method(metal_tmr_method_key).load()
 
     # Mineral
     mineral_rmi_method_key = ("Mineral RMI", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(mineral_rmi_method_key).register()
-    bd.Method(mineral_rmi_method_key).write(rmi_mineral)
+    _write_method(bd, mineral_rmi_method_key, rmi_mineral)
     # bd.Method(mineral_rmi_method_key).load()
 
     mineral_tmr_method_key = ("Mineral TMR", "imaginaryendpoint", "imaginarymidpoint")
-    bd.Method(mineral_tmr_method_key).register()
-    bd.Method(mineral_tmr_method_key).write(tmr_mineral)
+    _write_method(bd, mineral_tmr_method_key, tmr_mineral)
     # bd.Method(mineral_tmr_method_key).load()
 
     print(notfound)
@@ -383,60 +495,50 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
     ## Biotic Add Flows  ####
     #########################
 
-    rmi_agrar_df = pd.read_csv(cf_dir / "agrar_rmi.csv", sep=";", decimal=",")
-    tmr_agrar_df = pd.read_csv(cf_dir / "agrar_tmr.csv", sep=";", decimal=",")
-    rmi_aqua_df = pd.read_csv(cf_dir / "aquatic_rmi.csv", sep=";", decimal=",")
-    tmr_aqua_df = pd.read_csv(cf_dir / "aquatic_tmr.csv", sep=";", decimal=",")
-
-    found_agrar_proc = []
-    found_aqua_proc = []
+    exchange_tables = _load_viacf_exchange_tables(cf_version)
+    flows_by_name = {
+        "Agrar RMI": rmi_agrar_flow,
+        "Agrar TMR": tmr_agrar_flow,
+        "Aquatic RMI": rmi_aqua_flow,
+        "Aquatic TMR": tmr_aqua_flow,
+    }
+    factor_maps = {
+        group["exchange_name"]: _build_factor_map(table, group["value_column"])
+        for group, table in exchange_tables
+    }
+    found_products = {group["exchange_name"]: set() for group, _ in exchange_tables}
 
     for act in ecoinvent_db:
-        if act["reference product"] in list(rmi_agrar_df["Material"]) and "production" in act["name"]:
-            found_agrar_proc.append(act["reference product"])
+        reference_product = act.get("reference product")
+        if "production" not in act["name"]:
+            continue
 
-            amount = float(
-                rmi_agrar_df.loc[
-                    rmi_agrar_df["Material"] == act["reference product"], "CF RMI agriculture"
-                ].iloc[0]
+        for group, _ in exchange_tables:
+            factors = factor_maps[group["exchange_name"]]
+            if reference_product not in factors:
+                continue
+
+            found_products[group["exchange_name"]].add(reference_product)
+            _upsert_biosphere_exchange(
+                activity=act,
+                input_flow=flows_by_name[group["input_flow_name"]],
+                amount=float(factors[reference_product]),
+                exchange_name=group["exchange_name"],
             )
-            new_exc = act.new_exchange(input=rmi_agrar_flow, amount=amount, type="biosphere")
-            new_exc["name"] = "Agrar RMI"
-            new_exc.save()
 
-        if act["reference product"] in list(tmr_agrar_df["Material"]) and "production" in act["name"]:
-            amount = float(
-                tmr_agrar_df.loc[
-                    tmr_agrar_df["Material"] == act["reference product"], "CF RMI agriculture"
-                ].iloc[0]
-            )  # <- Wrong Columnname in Excelsheet
-            new_exc = act.new_exchange(input=tmr_agrar_flow, amount=amount, type="biosphere")
-            new_exc["name"] = "Agrar TMR"
-            new_exc.save()
-
-        if act["reference product"] in list(rmi_aqua_df["Material"]) and "production" in act["name"]:
-            found_aqua_proc.append(act["reference product"])
-            amount = float(
-                rmi_aqua_df.loc[
-                    rmi_aqua_df["Material"] == act["reference product"], "CF RMI aquatic"
-                ].iloc[0]
-            )
-            new_exc = act.new_exchange(input=rmi_aqua_flow, amount=amount, type="biosphere")
-            new_exc["name"] = "Aqua RMI"
-            new_exc.save()
-
-        if act["reference product"] in list(tmr_aqua_df["Material"]) and "production" in act["name"]:
-            amount = float(
-                tmr_aqua_df.loc[
-                    tmr_aqua_df["Material"] == act["reference product"], "CF RMI aquatic"
-                ].iloc[0]
-            )  # <- Wrong Columnname in Excelsheet
-            new_exc = act.new_exchange(input=tmr_aqua_flow, amount=amount, type="biosphere")
-            new_exc["name"] = "Aqua TMR"
-            new_exc.save()
-
-    not_found_agrar = [item for item in rmi_agrar_df["Material"] if item not in found_agrar_proc]
-    not_found_aqua = [item for item in rmi_aqua_df["Material"] if item not in found_aqua_proc]
+    tables_by_exchange_name = {
+        group["exchange_name"]: table for group, table in exchange_tables
+    }
+    not_found_agrar = [
+        item
+        for item in tables_by_exchange_name["Agrar RMI"]["Material"]
+        if item not in found_products["Agrar RMI"]
+    ]
+    not_found_aqua = [
+        item
+        for item in tables_by_exchange_name["Aqua RMI"]["Material"]
+        if item not in found_products["Aqua RMI"]
+    ]
 
     print(not_found_agrar)
     print(not_found_aqua)
@@ -474,21 +576,39 @@ def create_pmf_method_viacf(cf_version: str, bw_project_name: str):
         )
     """
 
-def create_pmf_method_direct():
+
+def create_pmf_method_direct(
+    bw_project_name: str | None = None,
+    ecoinvent_database: str | None = None,
+    biosphere_database: str | None = None,
+) -> None:
   """Create the direct PMF methods and supporting exchanges in Brightway.
 
   This workflow derives PMF information directly from the available ecoinvent
   and biosphere data in the current Brightway project.
+
+  Parameters
+  ----------
+  bw_project_name:
+      Optional Brightway project name. If omitted, the current project is used.
+  ecoinvent_database, biosphere_database:
+      Optional exact database names. Automatic detection succeeds only when
+      one unambiguous matching database exists for each role.
   """
   import bw2data as bd
 
-  for db in list(bd.databases):
-    if "cutoff" in db:
-      ecoinvent_name = db
+  if bw_project_name is not None:
+    bd.projects.set_current(bw_project_name)
 
-  for db in list(bd.databases):
-    if "biosphere" in db:
-      biosphere_name = db
+  ecoinvent_name, biosphere_name = _find_relevant_databases(
+      bd,
+      ecoinvent_database=ecoinvent_database,
+      biosphere_database=biosphere_database,
+  )
+  if ecoinvent_name is None:
+    raise ValueError("No database containing 'cutoff' was found.")
+  if biosphere_name is None:
+    raise ValueError("No database containing 'biosphere' was found.")
 
   ################################
   ## Additional biosphere flows ##
@@ -533,7 +653,6 @@ def create_pmf_method_direct():
 
 
   overburden     = bd.Database(biosphere_name).search("Overburden")[0]
-  gangue         = bd.Database(biosphere_name).search("Gangue")[0]
   biomass_used   = bd.Database(biosphere_name).search("Biomass, used")[0]
   biomass_unused = bd.Database(biosphere_name).search("Biomass, unused")[0]
 
@@ -558,7 +677,8 @@ def create_pmf_method_direct():
 
         for ex in act.exchanges():
           if ex["name"] == "Overburden":
-            ex["amount"] == amount
+            ex["amount"] = amount
+            ex.save()
 
 
       if needstobein == True and alreadyin == False:
@@ -593,16 +713,6 @@ def create_pmf_method_direct():
   forestry_categories_list = [
     "0210:Silviculture and other forestry activities",
     "0220:Logging"
-  ]
-
-  animal_categories_list = [
-
-    "0141:Raising of cattle and buffaloes",
-    "0144:Raising of sheep and goats",
-    "0145:Raising of swine|pigs",
-    "0146:Raising of poultry",
-    "0149:Raising of other animals"
-
   ]
 
   ### Agriculture ###
@@ -660,9 +770,8 @@ def create_pmf_method_direct():
     skip = True
     if "market" not in act["name"]:
       for cat in agriculture_categories_list:
-        if cat in act["classifications"][0]:
-          if act["unit"] == "kilogram":
-            skip = False
+        if cat in act["classifications"][0] and act["unit"] == "kilogram":
+          skip = False
 
     for ex in act.exchanges():
       if ex["name"] == "Biomass, unused":
@@ -755,13 +864,15 @@ def create_pmf_method_direct():
 
   for act in bd.Database(ecoinvent_name):
     skip = True
-    if "market" not in act["name"]:
-      if act["classifications"][0] == "0311:Marine fishing":
-        for ex in act.exchanges():
-          if ex["name"] == "Biomass, used":
-            skip = False
-            used_biomass_amount = ex.amount
-            residue_ratio = 4 / 6
+    if (
+      "market" not in act["name"]
+      and act["classifications"][0] == "0311:Marine fishing"
+    ):
+      for ex in act.exchanges():
+        if ex["name"] == "Biomass, used":
+          skip = False
+          used_biomass_amount = ex.amount
+          residue_ratio = 4 / 6
 
     for ex in act.exchanges():
       if ex["name"] == "Biomass, unused":
